@@ -1,0 +1,172 @@
+# The following is used for ERD/ ERS analysis in python solely on 30s trials
+from CSV_EDF_Conv import load_brainflow_eeg
+import mne
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd      
+import seaborn as sns
+from mne.time_frequency import tfr_morlet    
+from matplotlib.colors import TwoSlopeNorm
+from mne.stats import permutation_cluster_1samp_test as pcluster_test
+
+
+FILE = r"C:\Users\there\OneDrive\Desktop\OPENBCI capstone data\Adjusted Motor Tests\Delta Trials\30s\OpenBCISession_A24_1008_Ethan_2\BrainFlow-RAW_A24_1008_Ethan_2_0.csv"   # point to the one file you want
+FS   = 250  # use the correct sampling rate
+
+
+# 1) Get Raw from your reusable loader (one line)
+raw = load_brainflow_eeg(FILE, sfreq=FS)
+
+
+# 2) Now do your *analysis* (add steps later as needed)
+raw.load_data()
+raw.notch_filter(60)
+raw.filter(1., 40., fir_design="firwin")
+raw.set_eeg_reference("average")
+
+
+event_time_sec = 46.0 #adjust for every exact time for event
+event_sample = int(event_time_sec * FS)
+
+
+events = np.array([[event_sample, 0, 2]])
+event_id = dict(r_hand = 2)#This is the map event, a 7 sec window
+
+
+tmin, tmax = -4,3
+
+
+epochs = mne.Epochs(
+    raw,
+    events,
+    event_id = event_id,
+    tmin=tmin,
+    tmax=tmax,  
+    picks = ("C3", "Cz", "C4"),
+    baseline = None,
+    preload = True
+)
+
+
+freqs = np.arange(2, 36) #Freqs from 2 - 35hz
+vmin, vmax = -1, 1.5
+baseline = (-4,-2) #ERD calculation interval in s
+cnorm = TwoSlopeNorm(vmin=vmin, vcenter=0, vmax=vmax)
+
+
+kwargs=dict(
+    n_permutations=100, step_down_p=0.05, seed=1, buffer_size=None, out_type="mask"
+)
+
+
+tfr = epochs.compute_tfr(
+    method = "multitaper",
+    freqs=freqs,
+    n_cycles=freqs,
+    use_fft=True,
+    return_itc=False,
+    average=False,
+    decim=2,
+)
+
+
+
+
+tfr.crop(tmin, tmax) .apply_baseline(baseline, mode="percent")
+
+
+tfr_ev = tfr['r_hand']
+data = tfr_ev.data
+times = tfr_ev.times
+freqs = tfr_ev.freqs
+
+
+mu_idx = (freqs >= 8) & (freqs <= 13)
+event_mask = (times >= 0.0) & (times <= 2.0)
+mu_erd_event = data[:, :, mu_idx, :][:, :, :, event_mask].mean(axis=(2, 3))
+print("Mu ERD (%) trial 0, C3:", mu_erd_event[0, 0])
+
+
+beta_idx = (freqs >= 13) & (freqs <= 30)
+event_mask1 = (times >= 2.0) & (times <= 4.0)
+beta_erd_event = data[:, :, beta_idx, :][:, :, :, event_mask1].mean(axis=(2, 3))
+print("Beta ERS (%) trial 0, C3:", beta_erd_event[0, 0])
+
+
+
+
+
+
+#The following segment is for group comparison: ie all 3 trials in 30 seconds
+# for event in event_id:
+#     tfr_ev = tfr[event]
+#     fig, axes = plt.subplots(
+#         1,4, figsize = (12,4), gridspec_kw={"width_ratios": [10,10,10,1]}
+#     )
+# for ch, ax in enumerate(axes[:-1]):  # for each channel
+#     # positive clusters
+#     _, c1, p1, _ = pcluster_test(tfr_ev.data[:, ch], tail=1, **kwargs)
+#     #negative clusters
+#     _, c2, p2, _ = pcluster_test(tfr_ev.data[:, ch], tail=-1, **kwargs)
+
+
+
+
+#     c = np.stack(c1 + c2, axis=2) #combined clusters
+#     p = np.concatenate((p1,p2)) #combined p-values
+#     mask = c[..., p <= 0.05].any(axis=-1)
+
+
+#     #plot TFR (ERD map with masking)
+#     tfr_ev.average().plot(
+#         [ch],
+#         cmap="RdBu",
+#         cnorm=cnorm,
+#         axes=ax,
+#         colorbar=False,
+#         show=False,
+#         mask=mask,
+#         mask_style="mask",
+#     )
+
+
+#     ax.set_title(epoch.ch_names[ch], fontsize=10)
+#     ax.axvline(0, linewidth=1, color="black", linestyle=":") #event
+#     if ch != 0:
+#         ax.set_ylabel("")
+#         ax.set_yticklabels("")
+# fig.colorbar(axes[0].images[-1], cax=axes[-1]).ax.set_yscale("linear")
+# fig.suptitle(f"ERDS ({event})")
+# plt.show()
+df = tfr.to_data_frame(time_format=None, long_format=True)
+df["condition"] = "r_hand"
+
+
+freq_bounds = {"_": 0, "delta":3, "theta": 7, "alpha":13, "beta": 35, "gamma": 140}
+df["band"] = pd.cut(
+    df["freq"], list(freq_bounds.values()), labels=list(freq_bounds)[1:]
+)
+
+
+#Filter to retain only relevant freq band:
+freq_bands_of_interest = ["alpha", "beta"]
+df = df[df.band.isin(freq_bands_of_interest)]
+df["band"] = df["band"].cat.remove_unused_categories()
+
+
+#order channels for plotting
+df["channel"] = df["channel"].cat.reorder_categories(("C3","Cz", "C4"), ordered=True)
+
+
+g = sns.FacetGrid(df, row="band", col="channel", margin_titles=True)
+g.map(sns.lineplot, "time", "value", "condition", n_boot=10)
+axline_kw = dict(color="black", linestyle="dashed", linewidth=0.5, alpha=0.5)
+g.map(plt.axhline, y=0, **axline_kw)
+g.map(plt.axvline, x=0, **axline_kw)
+g.set(ylim=(-2, 2))
+g.set_axis_labels("Time (s)", "ERDS")
+g.set_titles(col_template="{col_name}", row_template="{row_name}")
+g.add_legend(ncol=2, loc="lower center")
+g.fig.subplots_adjust(left=0.1, right=0.9, top=0.9, bottom=0.08)
+plt.show()
+
